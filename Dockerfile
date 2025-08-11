@@ -15,6 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the rest of the application code
 COPY . .
 
-# The command to run your script
+# Make the startup script executable
+RUN chmod +x /app/start.sh
 
-CMD ["python", "bot.py"]
+# Set the command to run the startup script
+CMD ["./start.sh"]
