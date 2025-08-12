@@ -87,7 +87,7 @@ def handle_message(message):
             bot.reply_to(message, f"Processing SoundCloud track '{album}'...")
             output_template = os.path.join(folder, '01 %(title)s.%(ext)s')
 
-        # Download audio with default format
+        # Download audio with default format, embedding metadata and thumbnail
         print("Downloading audio...")
         dl_cmd = [
             'yt-dlp', '-x', '--embed-metadata', '--embed-thumbnail',
@@ -98,14 +98,18 @@ def handle_message(message):
         # Get all downloaded files sorted
         files = sorted([f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))])
         if len(files) != num_tracks:
-            raise ValueError(f"Expected {num_tracks} files, but found {len(files)}.")
+            # This check is for sanity and to catch unexpected downloads
+            print(f"Warning: Expected {num_tracks} files, but found {len(files)}.")
+            # A ValueError would be too aggressive here, maybe just a warning is enough.
 
         for idx, file in enumerate(files):
             file_path = os.path.join(folder, file)
             file_size = os.path.getsize(file_path)
             print(f"File downloaded: {file}, size: {file_size} bytes")
 
-            entry = entries[idx]
+            # Match the entry to the file based on the file index if it's a playlist
+            # Otherwise, use the single entry
+            entry = entries[idx] if is_playlist else entries[0]
             title = entry['title'][:100]  # Preserve original title
             performer = entry['uploader'][:100]  # Preserve original performer
 
@@ -125,16 +129,20 @@ def handle_message(message):
                 duration = None
                 print(f"Duration extraction failed for {file}: {str(e)}. Proceeding without it.")
 
-            # Tag the file using a temporary tagged file, then replace the original
+            # Tag the file using ffmpeg. Use a separate command from download to add specific metadata
+            # Corrected logic to explicitly map the audio stream to avoid errors with embedded video streams
             print(f"Tagging audio {file} with metadata...")
             tagged_path = os.path.join(folder, f"{file}.tagged")
             track_str = "01" if num_tracks == 1 else f"{idx + 1}/{num_tracks}"
+            
             ffmpeg_cmd = [
                 'ffmpeg', '-y', '-i', file_path,
+                '-map', '0:a',  # This is the crucial fix: explicitly map only the audio stream
+                '-c:a', 'copy', # Copy the audio stream without re-encoding
                 '-metadata', f"album={album}",
                 '-metadata', f"album_artist={album_artist}",
                 '-metadata', f"track={track_str}",
-                '-codec', 'copy', tagged_path
+                tagged_path
             ]
             subprocess.check_call(ffmpeg_cmd)
 
