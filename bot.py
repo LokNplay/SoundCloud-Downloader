@@ -3,6 +3,7 @@ import subprocess
 import os
 import shutil
 import re
+import json
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Retrieve the bot token and proxy URL from environment variables for security and flexibility
@@ -53,99 +54,120 @@ def handle_message(message):
         print("Processing SoundCloud link...")
         bot.reply_to(message, "Processing your SoundCloud link... This may take a moment.")
 
-        # Get info using yt-dlp
+        # Get info using yt-dlp --dump-json
         print("Fetching metadata...")
-        info_cmd = ['yt-dlp', '--print', "%(uploader)s|||%(title)s|||%(ext)s", url]
-        info_output = subprocess.check_output(info_cmd).decode().strip()
-        print(f"Metadata received: {info_output}")
+        info_output = subprocess.check_output(['yt-dlp', '-J', url]).decode()
+        info = json.loads(info_output)
+        print("Metadata received.")
 
-        artist, title, ext = info_output.split('|||')
+        invalid_chars = r'[/\\:*?"<>|()]'  # Characters to replace in filenames only
 
-        # Sanitize artist and title to create a valid folder and filename
-        invalid_chars = r'[/\\:*?"<>|()]'
-        artist = re.sub(invalid_chars, '_', artist.strip())[:50]
-        title = re.sub(invalid_chars, '_', title.strip())[:50]
-        print(f"Sanitized artist: {artist}, title: {title}, ext: {ext}")
+        if 'entries' in info:
+            entries = info['entries']
+            album = info['title'][:100]  # Preserve original album name, limit to 100 chars
+            album_artist = info.get('uploader', 'Various')[:100]  # Preserve original artist
+        else:
+            entries = [info]
+            album = info['title'][:100]
+            album_artist = info['uploader'][:100]
 
-        # Set folder and filename within the temporary directory
-        folder = os.path.join(temp_dir, f"{artist} - {title}")
-        filename = f"01 {title}.{ext}"
-        file_path = os.path.join(folder, filename)
+        num_tracks = len(entries)
+        is_playlist = num_tracks > 1
+
+        # Sanitize folder and filename parts only where needed
+        folder_name = re.sub(invalid_chars, '_', f"{album_artist} - {album}")[:100]
+        folder = os.path.join(temp_dir, folder_name)
         print(f"Creating folder: {folder}")
-
         os.makedirs(folder, exist_ok=True)
+
+        if is_playlist:
+            bot.reply_to(message, f"Processing SoundCloud playlist '{album}' with {num_tracks} tracks... This may take a while.")
+            output_template = os.path.join(folder, '%(playlist_index)02d %(uploader)s - %(title)s.%(ext)s')
+        else:
+            bot.reply_to(message, f"Processing SoundCloud track '{album}'...")
+            output_template = os.path.join(folder, '01 %(title)s.%(ext)s')
 
         # Download audio with default format
         print("Downloading audio...")
         dl_cmd = [
             'yt-dlp', '-x', '--embed-metadata', '--embed-thumbnail',
-            '-o', file_path, url
+            '-o', output_template, url
         ]
         subprocess.check_call(dl_cmd)
 
-        # Verify file exists
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"Downloaded file not found: {file_path}")
-        file_size = os.path.getsize(file_path)
-        print(f"Download complete. File size: {file_size} bytes")
+        # Get all downloaded files sorted
+        files = sorted([f for f in os.listdir(folder) if os.path.isfile(os.path.join(folder, f))])
+        if len(files) != num_tracks:
+            raise ValueError(f"Expected {num_tracks} files, but found {len(files)}.")
 
-        # Get duration using ffprobe (more reliable)
-        duration = None
-        try:
-            duration_cmd = [
-                'ffprobe', '-v', 'error', '-show_entries',
-                'format=duration', '-of',
-                'default=noprint_wrappers=1:nokey=1', file_path
-            ]
-            duration_output = subprocess.check_output(duration_cmd).decode().strip()
-            duration = int(float(duration_output)) if duration_output else None
-            if duration:
-                print(f"Duration extracted: {duration} seconds")
-        except Exception as e:
+        for idx, file in enumerate(files):
+            file_path = os.path.join(folder, file)
+            file_size = os.path.getsize(file_path)
+            print(f"File downloaded: {file}, size: {file_size} bytes")
+
+            entry = entries[idx]
+            title = entry['title'][:100]  # Preserve original title
+            performer = entry['uploader'][:100]  # Preserve original performer
+
+            # Get duration using ffprobe (more reliable)
             duration = None
-            print(f"Duration extraction failed: {str(e)}. Proceeding without it.")
+            try:
+                duration_cmd = [
+                    'ffprobe', '-v', 'error', '-show_entries',
+                    'format=duration', '-of',
+                    'default=noprint_wrappers=1:nokey=1', file_path
+                ]
+                duration_output = subprocess.check_output(duration_cmd).decode().strip()
+                duration = int(float(duration_output)) if duration_output else None
+                if duration:
+                    print(f"Duration extracted for {file}: {duration} seconds")
+            except Exception as e:
+                duration = None
+                print(f"Duration extraction failed for {file}: {str(e)}. Proceeding without it.")
 
-        # Tag the file using a temporary tagged file, then replace the original
-        print("Tagging audio with metadata...")
-        tagged_path = os.path.join(folder, f"01 {title} (tagged).{ext}")
-        ffmpeg_cmd = [
-            'ffmpeg', '-y', '-i', file_path,
-            '-metadata', f"album={title}",
-            '-metadata', f"album_artist={artist}",
-            '-metadata', "track=01",
-            '-codec', 'copy', tagged_path
-        ]
-        subprocess.check_call(ffmpeg_cmd)
+            # Tag the file using a temporary tagged file, then replace the original
+            print(f"Tagging audio {file} with metadata...")
+            tagged_path = os.path.join(folder, f"{file}.tagged")
+            track_str = "01" if num_tracks == 1 else f"{idx + 1}/{num_tracks}"
+            ffmpeg_cmd = [
+                'ffmpeg', '-y', '-i', file_path,
+                '-metadata', f"album={album}",
+                '-metadata', f"album_artist={album_artist}",
+                '-metadata', f"track={track_str}",
+                '-codec', 'copy', tagged_path
+            ]
+            subprocess.check_call(ffmpeg_cmd)
 
-        # Replace original with tagged file
-        print("Replacing original file with tagged version...")
-        os.replace(tagged_path, file_path)
+            # Replace original with tagged file
+            print(f"Replacing original file {file} with tagged version...")
+            os.replace(tagged_path, file_path)
 
-        # Send the audio file with retries
-        print("Sending audio...")
-        try:
-            with open(file_path, 'rb') as audio_file:
-                send_audio_with_retry(
-                    message.chat.id,
-                    audio_file,
-                    title=title,
-                    performer=artist,
-                    duration=duration,
-                    reply_to_message_id=message.message_id
-                )
-        except Exception as e:
-            print(f"Audio send failed: {str(e)}. Trying as a document...")
-            with open(file_path, 'rb') as audio_file:
-                bot.send_document(
-                    message.chat.id,
-                    audio_file,
-                    visible_file_name=f"{artist} - {title}.{ext}",
-                    caption=f"{artist} - {title}",
-                    reply_to_message_id=message.message_id,
-                    timeout=300
-                )
+            # Send the audio file with retries
+            print(f"Sending audio {file}...")
+            try:
+                with open(file_path, 'rb') as audio_file:
+                    send_audio_with_retry(
+                        message.chat.id,
+                        audio_file,
+                        title=title,
+                        performer=performer,
+                        duration=duration,
+                        reply_to_message_id=message.message_id
+                    )
+            except Exception as e:
+                print(f"Audio send failed for {file}: {str(e)}. Trying as a document...")
+                ext = file.rsplit('.', 1)[-1] if '.' in file else 'opus'
+                with open(file_path, 'rb') as audio_file:
+                    bot.send_document(
+                        message.chat.id,
+                        audio_file,
+                        visible_file_name=f"{performer} - {title}.{ext}",
+                        caption=f"{performer} - {title}",
+                        reply_to_message_id=message.message_id,
+                        timeout=300
+                    )
 
-        print("Done! Audio sent successfully.")
+        print("Done! All audio sent successfully.")
 
     except Exception as e:
         print(f"Error processing the link: {str(e)}")
